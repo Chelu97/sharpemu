@@ -95,6 +95,7 @@ internal static class Gen5ShaderScalarEvaluator
         var scalarRegisterSnapshots = new Dictionary<uint, IReadOnlyList<uint>>();
         var scalarConditionCode = false;
         uint? skipUntilPc = null;
+        var skippedRanges = new List<SkippedRange>();
 
         foreach (var instruction in state.Program.Instructions)
         {
@@ -119,6 +120,12 @@ internal static class Gen5ShaderScalarEvaluator
                 TryGetSoppBranchTargetPc(instruction, out var targetPc) &&
                 targetPc > instruction.Pc)
             {
+                skippedRanges.Add(new SkippedRange(
+                    instruction.Pc,
+                    targetPc,
+                    (uint[])scalarRegisters.Clone(),
+                    scalarConditionCode,
+                    execMask));
                 skipUntilPc = targetPc;
                 continue;
             }
@@ -409,6 +416,16 @@ internal static class Gen5ShaderScalarEvaluator
                     : null));
         }
 
+        CollectSkippedRangeBindings(
+            ctx,
+            state,
+            skippedRanges,
+            resolved,
+            globalMemoryBindings,
+            globalMemoryByAddress,
+            runtimeScalarRegisters,
+            resolveVertexInputs);
+
         evaluation = new Gen5ShaderEvaluation(
             initialScalarRegisters,
             scalarRegisters,
@@ -418,6 +435,297 @@ internal static class Gen5ShaderScalarEvaluator
             state.ComputeSystemRegisters,
             runtimeScalarRegisters,
             vertexInputBindings);
+        return true;
+    }
+
+    private sealed record SkippedRange(
+        uint BranchPc,
+        uint TargetPc,
+        uint[] Registers,
+        bool ConditionCode,
+        ulong ExecMask);
+
+    // The pass above follows unconditional forward branches, so the not-taken side of an if/else
+    // never executes and descriptor-based ops inside it stay unresolved. The SPIR-V translator
+    // still emits those blocks and rejects the whole draw over the missing binding (Quake's world
+    // pixel shader samples its material buffers inside exactly such a block). Re-walk each skipped
+    // range with the register state captured at the branch - the entry state of the skipped block -
+    // recording bindings only; any failure just leaves that range unresolved, as before.
+    private static void CollectSkippedRangeBindings(
+        CpuContext ctx,
+        Gen5ShaderState state,
+        List<SkippedRange> ranges,
+        List<Gen5ImageBinding> resolved,
+        List<Gen5GlobalMemoryBinding> globalMemoryBindings,
+        Dictionary<(uint ScalarAddress, ulong BaseAddress), Gen5GlobalMemoryBinding> globalMemoryByAddress,
+        HashSet<uint> runtimeScalarRegisters,
+        bool resolveVertexInputs)
+    {
+        for (var rangeIndex = 0; rangeIndex < ranges.Count; rangeIndex++)
+        {
+            var range = ranges[rangeIndex];
+            var registers = range.Registers;
+            var conditionCode = range.ConditionCode;
+            var execMask = range.ExecMask;
+            uint? skipUntilPc = null;
+            foreach (var instruction in state.Program.Instructions)
+            {
+                if (instruction.Pc <= range.BranchPc)
+                {
+                    continue;
+                }
+
+                if (instruction.Pc >= range.TargetPc)
+                {
+                    break;
+                }
+
+                if (skipUntilPc.HasValue)
+                {
+                    if (instruction.Pc < skipUntilPc.Value)
+                    {
+                        continue;
+                    }
+
+                    skipUntilPc = null;
+                }
+
+                if (instruction.Opcode == "SEndpgm")
+                {
+                    break;
+                }
+
+                if (instruction.Opcode == "SBranch" &&
+                    TryGetSoppBranchTargetPc(instruction, out var targetPc) &&
+                    targetPc > instruction.Pc)
+                {
+                    if (targetPc < range.TargetPc)
+                    {
+                        ranges.Add(new SkippedRange(
+                            instruction.Pc,
+                            targetPc,
+                            (uint[])registers.Clone(),
+                            conditionCode,
+                            execMask));
+                    }
+
+                    skipUntilPc = targetPc;
+                    continue;
+                }
+
+                if (instruction.Encoding == Gen5ShaderEncoding.Sopc)
+                {
+                    if (!TryExecuteScalarCompare(instruction, registers, out conditionCode, out _))
+                    {
+                        break;
+                    }
+
+                    continue;
+                }
+
+                if (instruction.Encoding == Gen5ShaderEncoding.Sopk &&
+                    instruction.Opcode.StartsWith("SCmpk", StringComparison.Ordinal))
+                {
+                    if (!TryExecuteScalarCompareK(instruction, registers, out conditionCode, out _))
+                    {
+                        break;
+                    }
+
+                    continue;
+                }
+
+                if (instruction.Encoding is
+                    Gen5ShaderEncoding.Sop1 or
+                    Gen5ShaderEncoding.Sop2 or
+                    Gen5ShaderEncoding.Sopk)
+                {
+                    if (instruction.Opcode is "SSetpcB64" or "SSwappcB64")
+                    {
+                        break;
+                    }
+
+                    if (!TryExecuteScalarAlu(
+                            instruction,
+                            state.Program.Address,
+                            registers,
+                            ref execMask,
+                            ref conditionCode,
+                            out _))
+                    {
+                        break;
+                    }
+
+                    continue;
+                }
+
+                if (instruction.Control is Gen5ScalarMemoryControl scalarMemory)
+                {
+                    foreach (var destination in instruction.Destinations)
+                    {
+                        if (destination.Kind == Gen5OperandKind.ScalarRegister &&
+                            destination.Value < ScalarRegisterCount)
+                        {
+                            runtimeScalarRegisters.Add(destination.Value);
+                        }
+                    }
+
+                    if (!TryExecuteScalarLoad(
+                            ctx,
+                            state,
+                            instruction,
+                            scalarMemory,
+                            registers,
+                            globalMemoryBindings,
+                            globalMemoryByAddress,
+                            runtimeScalarRegisters,
+                            out _))
+                    {
+                        break;
+                    }
+
+                    continue;
+                }
+
+                if (instruction.Control is Gen5GlobalMemoryControl globalMemory)
+                {
+                    if (globalMemory.ScalarAddress >= ScalarRegisterCount - 1)
+                    {
+                        break;
+                    }
+
+                    var baseAddress =
+                        registers[globalMemory.ScalarAddress] |
+                        ((ulong)registers[globalMemory.ScalarAddress + 1] << 32);
+                    if (baseAddress == 0 ||
+                        !TryRecordMemoryBinding(
+                            ctx,
+                            globalMemory.ScalarAddress,
+                            baseAddress,
+                            sizeBytes: null,
+                            instruction.Pc,
+                            globalMemoryBindings,
+                            globalMemoryByAddress))
+                    {
+                        break;
+                    }
+
+                    continue;
+                }
+
+                if (instruction.Control is Gen5BufferMemoryControl bufferMemory)
+                {
+                    if (bufferMemory.ScalarResource >= ScalarRegisterCount - 3 ||
+                        !TryDecodeBufferDescriptor(
+                            registers,
+                            bufferMemory.ScalarResource,
+                            strictType: true,
+                            out var bufferDescriptor) ||
+                        bufferDescriptor.BaseAddress == 0)
+                    {
+                        break;
+                    }
+
+                    if (resolveVertexInputs &&
+                        IsVertexFetchCandidate(instruction, bufferMemory, bufferDescriptor))
+                    {
+                        // Vertex-input locations are assigned by main-pass order; a fetch inside a
+                        // skipped block stays unresolved rather than perturbing those locations.
+                        continue;
+                    }
+
+                    if (!TryRecordMemoryBinding(
+                            ctx,
+                            bufferMemory.ScalarResource,
+                            bufferDescriptor.BaseAddress,
+                            bufferDescriptor.SizeBytes,
+                            instruction.Pc,
+                            globalMemoryBindings,
+                            globalMemoryByAddress))
+                    {
+                        break;
+                    }
+
+                    continue;
+                }
+
+                if (instruction.Control is not Gen5ImageControl image)
+                {
+                    continue;
+                }
+
+                if (!TryCopyRegisters(
+                        registers,
+                        image.ScalarResource,
+                        ImageDescriptorDwords,
+                        out var resourceDescriptor))
+                {
+                    break;
+                }
+
+                IReadOnlyList<uint> samplerDescriptor = [];
+                if (UsesSampler(instruction.Opcode) &&
+                    !TryCopyRegisters(
+                        registers,
+                        image.ScalarSampler,
+                        SamplerDescriptorDwords,
+                        out samplerDescriptor))
+                {
+                    break;
+                }
+
+                resolved.Add(new Gen5ImageBinding(
+                    instruction.Pc,
+                    instruction.Opcode,
+                    image,
+                    resourceDescriptor,
+                    samplerDescriptor,
+                    instruction.Opcode is "ImageLoadMip" or "ImageStoreMip" &&
+                    TryResolveVectorConstantBefore(
+                        state.Program,
+                        instruction.Pc,
+                        image.GetAddressRegister(2),
+                        out var mipLevel)
+                        ? mipLevel
+                        : null));
+            }
+        }
+    }
+
+    private static bool TryRecordMemoryBinding(
+        CpuContext ctx,
+        uint scalarRegister,
+        ulong baseAddress,
+        ulong? sizeBytes,
+        uint pc,
+        List<Gen5GlobalMemoryBinding> globalMemoryBindings,
+        Dictionary<(uint ScalarAddress, ulong BaseAddress), Gen5GlobalMemoryBinding> globalMemoryByAddress)
+    {
+        var key = (scalarRegister, baseAddress);
+        if (globalMemoryByAddress.TryGetValue(key, out var existingBinding))
+        {
+            if (existingBinding.InstructionPcs is List<uint> instructionPcs)
+            {
+                instructionPcs.Add(pc);
+            }
+
+            return true;
+        }
+
+        var read = sizeBytes is { } size
+            ? TryReadGlobalMemory(ctx, baseAddress, size, out var data)
+            : TryReadGlobalMemory(ctx, baseAddress, out data);
+        if (!read)
+        {
+            return false;
+        }
+
+        var binding = new Gen5GlobalMemoryBinding(
+            scalarRegister,
+            baseAddress,
+            new List<uint> { pc },
+            data);
+        globalMemoryByAddress.Add(key, binding);
+        globalMemoryBindings.Add(binding);
         return true;
     }
 
