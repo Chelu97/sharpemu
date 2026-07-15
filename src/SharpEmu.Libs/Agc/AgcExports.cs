@@ -100,6 +100,30 @@ public static class AgcExports
     private const uint CbBlend0Control = 0x1E0;
     private const uint PaScModeCntl0 = 0x292;
     private const int ColorTargetCount = 8;
+    // Synthetic GFX10-style DB register slots. libSceAgc never writes DB state
+    // through explicit context offsets; it arrives as a positional
+    // "DepthRenderTarget" block inside the cx indirect register tables (see
+    // TryApplyDepthRenderTargetBlock). The decoded fields are stored under
+    // these context offsets so GetDepthTarget can mirror GetRenderTargets.
+    private const uint DbHtileDataBase = 0x05;
+    private const uint DbDepthSizeXy = 0x07;
+    private const uint DbDepthClear = 0x0B;
+    private const uint DbZInfo = 0x10;
+    private const uint DbZReadBase = 0x12;
+    private const uint DbStencilReadBase = 0x14;
+    private const uint DbZWriteBase = 0x16;
+    private const uint DbStencilWriteBase = 0x18;
+    // Positional layout of the DepthRenderTarget block relative to the
+    // Z_READ_BASE anchor entry (all entries carry offset 0xFFFFFFFF).
+    private const int DepthBlockStencilReadOffset = 1;
+    private const int DepthBlockZWriteOffset = 2;
+    private const int DepthBlockStencilWriteOffset = 3;
+    private const int DepthBlockZInfoOffset = 9;
+    private const int DepthBlockHtileOffset = 10;
+    private const int DepthBlockSizeOffset = 11;
+    private const int DepthBlockClearOffset = 12;
+    private const int DepthBlockLength = 13;
+    private const int DepthBlockUnbindMinLength = 14;
     private const uint PsTextureUserDataRegister = 0xC;
     private const uint VsUserDataRegister = 0x4C;
     private const uint GsUserDataRegister = 0x8C;
@@ -328,6 +352,13 @@ public static class AgcExports
         uint NumberType,
         uint TileMode);
 
+    private readonly record struct DepthTargetDescriptor(
+        ulong Address,
+        ulong StencilAddress,
+        uint Width,
+        uint Height,
+        float ClearValue);
+
     private sealed record TranslatedGuestDraw(
         ulong ExportShaderAddress,
         ulong PixelShaderAddress,
@@ -383,6 +414,9 @@ public static class AgcExports
         public uint IndexSize { get; set; }
         public uint InstanceCount { get; set; } = 1;
         public uint DrawIndexOffset { get; set; }
+        // Depth targets whose bind was just (re-)emitted and still owe a
+        // hardware-style clear on first use (DB_DEPTH_CLEAR + HTILE clear).
+        public HashSet<ulong> PendingDepthClears { get; } = new();
     }
 
     private sealed class SubmittedGpuState
@@ -3183,6 +3217,9 @@ public static class AgcExports
             RShRegsIndirect => state.ShRegisters,
             _ => state.UcRegisters,
         };
+        var entries = register == RCxRegsIndirect
+            ? new List<(uint Offset, uint Value)>(checked((int)Math.Min(registerCount, 4096u)))
+            : null;
         for (uint index = 0; index < registerCount; index++)
         {
             var entryAddress = registersAddress + ((ulong)index * 8);
@@ -3192,9 +3229,142 @@ public static class AgcExports
                 return;
             }
 
-            if (registerOffset != 0)
+            entries?.Add((registerOffset, value));
+            if (registerOffset != 0 && registerOffset != uint.MaxValue)
             {
                 destination[registerOffset] = value;
+            }
+        }
+
+        if (entries is not null)
+        {
+            ApplyDepthRenderTargetBlocks(state, entries);
+        }
+    }
+
+    internal readonly record struct DecodedDepthBlock(
+        uint ZBase,
+        uint StencilBase,
+        uint HtileBase,
+        uint ZInfo,
+        uint SizeXy,
+        uint ClearBits)
+    {
+        public uint Width => (SizeXy & 0x3FFFu) + 1;
+
+        public uint Height => ((SizeXy >> 16) & 0x3FFFu) + 1;
+    }
+
+    /// <summary>
+    /// Decodes one run of (0xFFFFFFFF, value) pairs from a cx indirect
+    /// register table. libSceAgc emits depth-target state as a positional
+    /// block inside such runs: [j]=Z_READ_BASE>>8, [j+1]=STENCIL_READ_BASE>>8,
+    /// [j+2]=Z_WRITE_BASE>>8 (always equal to [j]),
+    /// [j+3]=STENCIL_WRITE_BASE>>8, [j+9]=Z_INFO, [j+10]=HTILE_BASE>>8,
+    /// [j+11]=SIZE ((w-1)|0xC000 in the low half, (h-1)|0xC000 in the high
+    /// half), [j+12]=DEPTH_CLEAR. A run of >=14 all-0xFFFFFFFF values unbinds
+    /// the depth target.
+    /// </summary>
+    internal static bool TryDecodeDepthRenderTargetRun(
+        IReadOnlyList<uint> values,
+        out DecodedDepthBlock block,
+        out bool unbind)
+    {
+        block = default;
+        unbind = false;
+        var allUnset = true;
+        for (var j = 0; j + DepthBlockLength <= values.Count; j++)
+        {
+            var zBase = values[j];
+            if (zBase is 0 or uint.MaxValue ||
+                values[j + DepthBlockZWriteOffset] != zBase)
+            {
+                continue;
+            }
+
+            var size = values[j + DepthBlockSizeOffset];
+            if ((size & 0xC000C000u) != 0xC000C000u)
+            {
+                continue;
+            }
+
+            var stencilWrite = values[j + DepthBlockStencilWriteOffset];
+            var htile = values[j + DepthBlockHtileOffset];
+            block = new DecodedDepthBlock(
+                zBase,
+                stencilWrite == uint.MaxValue ? 0 : stencilWrite,
+                htile == uint.MaxValue ? 0 : htile,
+                values[j + DepthBlockZInfoOffset],
+                size,
+                values[j + DepthBlockClearOffset]);
+            return true;
+        }
+
+        foreach (var value in values)
+        {
+            if (value != uint.MaxValue)
+            {
+                allUnset = false;
+                break;
+            }
+        }
+
+        unbind = allUnset && values.Count >= DepthBlockUnbindMinLength;
+        return false;
+    }
+
+    private static void ApplyDepthRenderTargetBlocks(
+        SubmittedDcbState state,
+        List<(uint Offset, uint Value)> entries)
+    {
+        var index = 0;
+        var runValues = new List<uint>();
+        while (index < entries.Count)
+        {
+            if (entries[index].Offset != uint.MaxValue)
+            {
+                index++;
+                continue;
+            }
+
+            runValues.Clear();
+            while (index < entries.Count && entries[index].Offset == uint.MaxValue)
+            {
+                runValues.Add(entries[index].Value);
+                index++;
+            }
+
+            if (TryDecodeDepthRenderTargetRun(runValues, out var block, out var unbind))
+            {
+                // Re-binds of the already-bound target keep accumulating depth;
+                // only a target switch with a valid DB_DEPTH_CLEAR value owes a
+                // clear on first use (0xFFFFFFFF = bind without fast clear).
+                state.CxRegisters.TryGetValue(DbZWriteBase, out var previousZBase);
+                if (block.ZBase != previousZBase && block.ClearBits != uint.MaxValue)
+                {
+                    state.PendingDepthClears.Add((ulong)block.ZBase << 8);
+                }
+
+                state.CxRegisters[DbZInfo] = block.ZInfo;
+                state.CxRegisters[DbZReadBase] = block.ZBase;
+                state.CxRegisters[DbZWriteBase] = block.ZBase;
+                state.CxRegisters[DbStencilReadBase] = block.StencilBase;
+                state.CxRegisters[DbStencilWriteBase] = block.StencilBase;
+                state.CxRegisters[DbHtileDataBase] = block.HtileBase;
+                state.CxRegisters[DbDepthSizeXy] = block.SizeXy;
+                state.CxRegisters[DbDepthClear] = block.ClearBits;
+                TraceAgc(
+                    $"agc.depth_bind z=0x{(ulong)block.ZBase << 8:X16} " +
+                    $"stencil=0x{(ulong)block.StencilBase << 8:X16} " +
+                    $"size={block.Width}x{block.Height} " +
+                    $"htile=0x{(ulong)block.HtileBase << 8:X16} " +
+                    $"clear=0x{block.ClearBits:X8}");
+            }
+            else if (unbind)
+            {
+                state.CxRegisters[DbZReadBase] = 0;
+                state.CxRegisters[DbZWriteBase] = 0;
+                TraceAgc("agc.depth_unbind");
             }
         }
     }
@@ -3393,6 +3563,45 @@ public static class AgcExports
             return;
         }
 
+        if (hasExportShader &&
+            !hasPixelShader &&
+            GetDepthTarget(state.CxRegisters) is not null)
+        {
+            if (TryCreateDepthOnlyGuestDraw(
+                    ctx,
+                    state,
+                    exportShaderAddress,
+                    vertexCount,
+                    indexed,
+                    out var depthDraw,
+                    out var depthError))
+            {
+                var globalMemoryBuffers =
+                    CreateVulkanGuestMemoryBuffers(depthDraw.GlobalMemoryBindings);
+                var vertexBuffers =
+                    CreateVulkanGuestVertexBuffers(depthDraw.VertexInputs);
+                VulkanVideoPresenter.SubmitDepthOnlyTranslatedDraw(
+                    depthDraw.VertexSpirv,
+                    depthDraw.PixelSpirv,
+                    globalMemoryBuffers,
+                    depthDraw.VertexCount,
+                    depthDraw.InstanceCount,
+                    depthDraw.PrimitiveType,
+                    depthDraw.IndexBuffer,
+                    vertexBuffers,
+                    depthDraw.RenderState);
+                TraceAgcShader(
+                    $"agc.depth_pass seq={drawSequence} es=0x{exportShaderAddress:X16} " +
+                    $"z=0x{depthDraw.RenderState.Depth?.Address ?? 0:X16} " +
+                    $"vertices={vertexCount}");
+                return;
+            }
+
+            TraceAgcShader(
+                $"agc.depth_pass_miss seq={drawSequence} es=0x{exportShaderAddress:X16} " +
+                $"vertices={vertexCount} error={depthError}");
+        }
+
         TraceShaderTranslationMiss(
             ctx,
             state,
@@ -3406,6 +3615,128 @@ public static class AgcExports
             hasPsInputAddr,
             psInputAddr,
             hasExportShader && hasPixelShader ? translationError : null);
+    }
+
+    private static byte[]? _depthOnlyFragmentSpirv;
+
+    private static bool TryCreateDepthOnlyGuestDraw(
+        CpuContext ctx,
+        SubmittedDcbState state,
+        ulong exportShaderAddress,
+        uint vertexCount,
+        bool indexed,
+        out TranslatedGuestDraw draw,
+        out string error)
+    {
+        draw = default!;
+        error = string.Empty;
+        ulong exportShaderHeader;
+        lock (_submitTraceGate)
+        {
+            _shaderHeadersByCode.TryGetValue(exportShaderAddress, out exportShaderHeader);
+        }
+
+        if (!Gen5ShaderTranslator.TryCreateState(
+                ctx,
+                exportShaderAddress,
+                exportShaderHeader,
+                state.ShRegisters,
+                SelectExportUserDataRegister(state.ShRegisters),
+                out var exportState,
+                out error,
+                userDataScalarRegisterBase: NggUserDataScalarRegisterBase) ||
+            !Gen5ShaderScalarEvaluator.TryEvaluate(
+                ctx,
+                exportState,
+                out var exportEvaluation,
+                out error,
+                resolveVertexInputs: true,
+                vertexRecordLimit: indexed ? null : vertexCount))
+        {
+            return false;
+        }
+
+        if (exportEvaluation.ImageBindings.Count != 0)
+        {
+            error = "depth-only draw with vertex image bindings is unsupported";
+            return false;
+        }
+
+        var exportStateFingerprint = ComputeShaderStructureFingerprint(exportEvaluation);
+        var shaderKey = (
+            exportShaderAddress,
+            exportStateFingerprint,
+            0UL,
+            0UL,
+            Gen5PixelOutputKind.Float,
+            0u);
+        (byte[] Vertex, byte[] Pixel) compiled;
+        lock (_submitTraceGate)
+        {
+            _graphicsSpirvCache.TryGetValue(shaderKey, out compiled);
+        }
+
+        if (compiled.Vertex is null || compiled.Pixel is null)
+        {
+            if (!Gen5SpirvTranslator.TryCompileVertexShader(
+                    exportState,
+                    exportEvaluation,
+                    out var vertexShader,
+                    out error,
+                    globalBufferBase: 0,
+                    totalGlobalBufferCount: exportEvaluation.GlobalMemoryBindings.Count + 1,
+                    imageBindingBase: 0,
+                    scalarRegisterBufferIndex: exportEvaluation.GlobalMemoryBindings.Count))
+            {
+                return false;
+            }
+
+            compiled = (
+                vertexShader.Spirv,
+                _depthOnlyFragmentSpirv ??= SpirvFixedShaders.CreateDepthOnlyFragment());
+            DumpSpirv(
+                "vs_depth",
+                exportShaderAddress,
+                exportStateFingerprint,
+                compiled.Vertex,
+                exportState.Program);
+            lock (_submitTraceGate)
+            {
+                _graphicsSpirvCache.TryAdd(shaderKey, compiled);
+            }
+        }
+
+        var globalMemoryBindings = exportEvaluation.GlobalMemoryBindings
+            .Append(CreateScalarRegisterBinding(exportEvaluation))
+            .ToArray();
+        IReadOnlyList<Gen5VertexInputBinding> vertexInputs =
+            exportEvaluation.VertexInputs ?? [];
+        state.UcRegisters.TryGetValue(VgtPrimitiveType, out var primitiveType);
+        var depthTarget = GetDepthTarget(state.CxRegisters)!.Value;
+        var syntheticTarget = new RenderTargetDescriptor(
+            Slot: 0,
+            Address: 0,
+            depthTarget.Width,
+            depthTarget.Height,
+            Format: 0,
+            NumberType: 0,
+            TileMode: 0);
+        draw = new TranslatedGuestDraw(
+            exportShaderAddress,
+            0,
+            primitiveType,
+            compiled.Vertex,
+            compiled.Pixel,
+            0,
+            vertexCount,
+            state.InstanceCount,
+            indexed ? CreateVulkanIndexBuffer(ctx, state, vertexCount) : null,
+            [],
+            globalMemoryBindings,
+            vertexInputs,
+            [],
+            CreateRenderState(state.CxRegisters, syntheticTarget, state));
+        return true;
     }
 
     private static bool TryCreateTranslatedGuestDraw(
@@ -3579,7 +3910,7 @@ public static class AgcExports
             vertexInputs,
             renderTargets,
             ApplyTransparentPremultipliedFillClear(
-                CreateRenderState(state.CxRegisters, renderTargets.FirstOrDefault()),
+                CreateRenderState(state.CxRegisters, renderTargets.FirstOrDefault(), state),
                 textures,
                 vertexInputs,
                 pixelEvaluation.InitialScalarRegisters));
@@ -3822,15 +4153,70 @@ public static class AgcExports
         return targets;
     }
 
+    private static DepthTargetDescriptor? GetDepthTarget(
+        IReadOnlyDictionary<uint, uint> registers)
+    {
+        if (!registers.TryGetValue(DbZWriteBase, out var zBase) || zBase == 0)
+        {
+            return null;
+        }
+
+        registers.TryGetValue(DbDepthSizeXy, out var size);
+        var width = (size & 0x3FFFu) + 1;
+        var height = ((size >> 16) & 0x3FFFu) + 1;
+        registers.TryGetValue(DbStencilWriteBase, out var stencilBase);
+        registers.TryGetValue(DbDepthClear, out var clearBits);
+        var clearValue = clearBits == uint.MaxValue
+            ? 1.0f
+            : BitConverter.UInt32BitsToSingle(clearBits);
+        return new DepthTargetDescriptor(
+            (ulong)zBase << 8,
+            (ulong)stencilBase << 8,
+            width,
+            height,
+            float.IsFinite(clearValue) ? clearValue : 1.0f);
+    }
+
+    private static readonly bool _depthRenderingDisabled = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_DEPTH"),
+        "1",
+        StringComparison.Ordinal);
+
+    private static VulkanGuestDepthState? CreateDepthState(
+        IReadOnlyDictionary<uint, uint> registers,
+        SubmittedDcbState state)
+    {
+        if (_depthRenderingDisabled ||
+            GetDepthTarget(registers) is not { } depthTarget)
+        {
+            return null;
+        }
+
+        // libSceAgc carries no DB_DEPTH_CONTROL equivalent in the observed
+        // streams; a bound depth target implies test+write with LessOrEqual.
+        return new VulkanGuestDepthState(
+            depthTarget.Address,
+            depthTarget.Width,
+            depthTarget.Height,
+            TestEnable: true,
+            WriteEnable: true,
+            ClearPending: state.PendingDepthClears.Remove(depthTarget.Address),
+            depthTarget.ClearValue);
+    }
+
     private static VulkanGuestRenderState CreateRenderState(
         IReadOnlyDictionary<uint, uint> registers,
-        RenderTargetDescriptor target)
+        RenderTargetDescriptor target,
+        SubmittedDcbState state)
     {
         var scissor = DecodeScissor(registers, target.Width, target.Height);
         return new VulkanGuestRenderState(
             DecodeBlendState(registers, target.Slot),
             scissor,
-            DecodeViewport(registers, target.Width, target.Height, scissor));
+            DecodeViewport(registers, target.Width, target.Height, scissor))
+        {
+            Depth = CreateDepthState(registers, state),
+        };
     }
 
     private static VulkanGuestBlendState DecodeBlendState(

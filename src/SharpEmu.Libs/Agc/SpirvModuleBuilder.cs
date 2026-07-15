@@ -221,6 +221,7 @@ internal enum SpirvDecoration : uint
     BuiltIn = 11,
     NoPerspective = 13,
     Flat = 14,
+    Invariant = 18,
     Location = 30,
     Binding = 33,
     DescriptorSet = 34,

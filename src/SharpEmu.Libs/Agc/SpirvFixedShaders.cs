@@ -92,6 +92,28 @@ internal static class SpirvFixedShaders
         return module.Build();
     }
 
+    /// <summary>
+    /// Empty fragment shader for depth-only passes: rasterization and the
+    /// fixed-function depth test do all the work.
+    /// </summary>
+    public static byte[] CreateDepthOnlyFragment()
+    {
+        var module = new SpirvModuleBuilder();
+        module.AddCapability(SpirvCapability.Shader);
+
+        var voidType = module.TypeVoid();
+        var functionType = module.TypeFunction(voidType);
+        var main = module.BeginFunction(voidType, functionType);
+        module.AddName(main, "main");
+        module.AddLabel();
+        module.AddStatement(SpirvOp.Return);
+        module.EndFunction();
+
+        module.AddEntryPoint(SpirvExecutionModel.Fragment, main, "main", []);
+        module.AddExecutionMode(main, SpirvExecutionMode.OriginUpperLeft);
+        return module.Build();
+    }
+
     public static byte[] CreateCopyFragment()
     {
         var module = new SpirvModuleBuilder();

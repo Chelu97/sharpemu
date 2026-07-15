@@ -650,6 +650,10 @@ internal static partial class Gen5SpirvTranslator
                     _positionOutput,
                     SpirvDecoration.BuiltIn,
                     (uint)SpirvBuiltIn.Position);
+                // Multi-pass renderers (z-prepass + material pass expecting
+                // ZFUNC=EQUAL) require bit-identical positions across the
+                // pipelines of both passes.
+                _module.AddDecoration(_positionOutput, SpirvDecoration.Invariant);
                 _interfaces.Add(_positionOutput);
 
                 var parameters = _state.Program.Instructions
