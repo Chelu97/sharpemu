@@ -133,6 +133,7 @@ public static class AgcExports
     private const uint Gen5TextureFormatR8G8B8A8Unorm = 56;
     private const uint Gen5TextureFormatR16G16B16A16Float = 71;
     private const uint Gen5TextureType2D = 9;
+    private const uint Gen5TextureType2DArray = 13;
     private const ulong MaxPresentedTextureBytes = 128UL * 1024UL * 1024UL;
     private const ulong VideoOutPixelFormatA8R8G8B8Srgb = 0x80000000;
     private const ulong VideoOutPixelFormatA8B8G8R8Srgb = 0x80002200;
@@ -321,7 +322,8 @@ public static class AgcExports
         uint BaseLevel,
         uint LastLevel,
         uint Pitch,
-        uint DstSelect)
+        uint DstSelect,
+        uint ArrayLayers = 1)
     {
         public uint MipLevels
         {
@@ -4558,6 +4560,52 @@ public static class AgcExports
             $"buffers=[{buffers}] vertex=[{vertexInputs}] indices=[{indices}]");
     }
 
+    private static readonly string? _textureDumpDirectory =
+        Environment.GetEnvironmentVariable("SHARPEMU_DUMP_TEXTURES");
+
+    private static readonly HashSet<(ulong Address, ulong Hash)> _dumpedTextures = new();
+
+    /// <summary>
+    /// Diagnostic: with SHARPEMU_DUMP_TEXTURES=&lt;dir&gt;, writes each distinct
+    /// sampled texture's raw guest bytes once as addr_WxH_fmtN_pP.bin.
+    /// </summary>
+    private static void DumpTextureSource(
+        TextureDescriptor descriptor,
+        uint sourceWidth,
+        byte[] source)
+    {
+        if (string.IsNullOrEmpty(_textureDumpDirectory))
+        {
+            return;
+        }
+
+        var hash = 1469598103934665603UL;
+        foreach (var value in source)
+        {
+            hash = (hash ^ value) * 1099511628211UL;
+        }
+
+        lock (_dumpedTextures)
+        {
+            if (!_dumpedTextures.Add((descriptor.Address, hash)))
+            {
+                return;
+            }
+        }
+
+        try
+        {
+            Directory.CreateDirectory(_textureDumpDirectory);
+            var name =
+                $"{descriptor.Address:X10}_{descriptor.Width}x{descriptor.Height}" +
+                $"_fmt{descriptor.Format}_p{sourceWidth}_t{descriptor.TileMode}_{hash:X16}.bin";
+            File.WriteAllBytes(Path.Combine(_textureDumpDirectory, name), source);
+        }
+        catch (IOException)
+        {
+        }
+    }
+
     private static IReadOnlyList<VulkanGuestDrawTexture> CreateVulkanGuestDrawTextures(
         CpuContext ctx,
         IReadOnlyList<TranslatedImageBinding> bindings,
@@ -4630,11 +4678,12 @@ public static class AgcExports
         out VulkanGuestDrawTexture texture)
     {
         texture = default!;
-        if (descriptor.Type != Gen5TextureType2D ||
+        if (descriptor.Type is not (Gen5TextureType2D or Gen5TextureType2DArray) ||
             descriptor.Width == 0 ||
             descriptor.Height == 0 ||
             descriptor.Width > 8192 ||
-            descriptor.Height > 8192)
+            descriptor.Height > 8192 ||
+            descriptor.ArrayLayers is 0 or > 64)
         {
             texture = CreateFallbackGuestDrawTexture(isStorage, descriptor.Format, descriptor.NumberType);
             return true;
@@ -4648,7 +4697,7 @@ public static class AgcExports
         var sourceByteCount = GetTextureByteCount(
             descriptor.Format,
             sourceWidth,
-            descriptor.Height);
+            descriptor.Height) * descriptor.ArrayLayers;
         if (sourceByteCount == 0 ||
             sourceByteCount > MaxPresentedTextureBytes ||
             sourceByteCount > int.MaxValue)
@@ -4659,6 +4708,7 @@ public static class AgcExports
 
         if (!isStorage &&
             descriptor.Address != 0 &&
+            descriptor.ArrayLayers == 1 &&
             VulkanVideoPresenter.IsGpuGuestImageAvailable(
                 descriptor.Address,
                 descriptor.Format,
@@ -4721,6 +4771,7 @@ public static class AgcExports
         }
 
         TraceTextureHash(descriptor, source);
+        DumpTextureSource(descriptor, sourceWidth, source);
 
         var nonZero = 0;
         for (var i = 0; i < source.Length; i++)
@@ -4757,7 +4808,8 @@ public static class AgcExports
             Pitch: sourceWidth,
             TileMode: descriptor.TileMode,
             DstSelect: descriptor.DstSelect,
-            Sampler: ToVulkanSampler(samplerDescriptor));
+            Sampler: ToVulkanSampler(samplerDescriptor),
+            ArrayLayers: descriptor.ArrayLayers);
         return true;
     }
 
@@ -5766,6 +5818,15 @@ public static class AgcExports
             return false;
         }
 
+        // word4[12:0] carries DEPTH: for TYPE 13 (2D_ARRAY) it is the last
+        // array index (kex Quake's lightmap atlas: 2048x2048, depth=3 -> 4
+        // layers, one per light style).
+        var arrayLayers = 1u;
+        if (type == Gen5TextureType2DArray && fields.Count >= 5)
+        {
+            arrayLayers = (fields[4] & 0x1FFFu) + 1;
+        }
+
         descriptor = new TextureDescriptor(
             address,
             width,
@@ -5777,7 +5838,8 @@ public static class AgcExports
             baseLevel,
             lastLevel,
             pitch,
-            dstSelect);
+            dstSelect,
+            arrayLayers);
         return true;
     }
 

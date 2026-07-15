@@ -156,7 +156,8 @@ internal static partial class Gen5SpirvTranslator
             uint ComponentType,
             uint VectorType,
             ImageComponentKind ComponentKind,
-            bool IsStorage);
+            bool IsStorage,
+            bool Arrayed);
 
         private readonly record struct SpirvVertexInput(
             uint Variable,
@@ -496,11 +497,15 @@ internal static partial class Gen5SpirvTranslator
                         SpirvCapability.StorageImageExtendedFormats);
                 }
 
+                // RDNA2 T# TYPE at word3[31:28]: 13 = 2D_ARRAY (e.g. kex
+                // Quake's 2048x2048x4 lightmap-style atlas).
+                var arrayed = binding.ResourceDescriptor.Count >= 4 &&
+                    ((binding.ResourceDescriptor[3] >> 28) & 0xFu) == 13;
                 var imageType = _module.TypeImage(
                     componentType,
                     SpirvImageDim.Dim2D,
                     depth: false,
-                    arrayed: false,
+                    arrayed,
                     multisampled: false,
                     sampled: isStorage ? 2u : 1u,
                     isStorage ? format : SpirvImageFormat.Unknown);
@@ -527,7 +532,8 @@ internal static partial class Gen5SpirvTranslator
                         componentType,
                         _module.TypeVector(componentType, 4),
                         componentKind,
-                        isStorage));
+                        isStorage,
+                        arrayed));
                 _interfaces.Add(variable);
             }
         }
@@ -1668,7 +1674,12 @@ internal static partial class Gen5SpirvTranslator
                 var hasCompare =
                     instruction.Opcode.Contains("SampleC", StringComparison.Ordinal);
                 var start = (hasOffset ? 1 : 0) + (hasCompare ? 1 : 0);
-                var coordinates = BuildFloatCoordinates(image, start);
+                // 2D_ARRAY samples carry (u, v, slice); the slice VGPR sits
+                // right after the plane coordinates.
+                var coordinates = resource.Arrayed
+                    ? BuildFloatArrayCoordinates(image, start)
+                    : BuildFloatCoordinates(image, start);
+                var coordinateCount = resource.Arrayed ? 3 : 2;
                 var explicitLod =
                     instruction.Opcode.Contains("Lz", StringComparison.Ordinal) ||
                     instruction.Opcode.Contains("SampleL", StringComparison.Ordinal);
@@ -1676,7 +1687,7 @@ internal static partial class Gen5SpirvTranslator
                     ? Float(0)
                     : Bitcast(
                         _floatType,
-                        LoadV(image.GetAddressRegister(start + 2)));
+                        LoadV(image.GetAddressRegister(start + coordinateCount)));
                 var offset = hasOffset ? BuildImageOffset(image, 0) : 0u;
                 var imageOperands =
                     (explicitLod ? 2u : 0u) | (hasOffset ? 0x10u : 0u);
@@ -1870,6 +1881,25 @@ internal static partial class Gen5SpirvTranslator
                     ImageComponentKind.Sint => _module.Constant(_intType, 1),
                     _ => Float(1),
                 });
+        }
+
+        private uint BuildFloatArrayCoordinates(Gen5ImageControl image, int start)
+        {
+            var x = Bitcast(
+                _floatType,
+                LoadV(image.GetAddressRegister(start)));
+            var y = Bitcast(
+                _floatType,
+                LoadV(image.GetAddressRegister(start + 1)));
+            var slice = Bitcast(
+                _floatType,
+                LoadV(image.GetAddressRegister(start + 2)));
+            return _module.AddInstruction(
+                SpirvOp.CompositeConstruct,
+                _module.TypeVector(_floatType, 3),
+                x,
+                y,
+                slice);
         }
 
         private uint BuildFloatCoordinates(Gen5ImageControl image, int start)
